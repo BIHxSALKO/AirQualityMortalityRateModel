@@ -1,0 +1,1035 @@
+---
+title: "Predicting the Impact of Air Quality on Mortality Rates in England"
+author: "Alan Salkanovic, Dipanshu Sehjal, Thomas Deegan"
+date: "May 29, 2018"
+output: ioslides_presentation
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+
+rm(list = ls())
+library(plyr)
+library(dplyr)
+library(lubridate)
+library(randomForest)
+library(caret)
+library(ggplot2)
+library(nnet)
+library(ROCR)
+library(DMwR)
+
+# Function to determine season based on date supplied
+getSeason <- function(DATES) {
+    WS <- as.Date("2012-12-15", format = "%Y-%m-%d") # Winter Solstice
+    SE <- as.Date("2012-3-15",  format = "%Y-%m-%d") # Spring Equinox
+    SS <- as.Date("2012-6-15",  format = "%Y-%m-%d") # Summer Solstice
+    FE <- as.Date("2012-9-15",  format = "%Y-%m-%d") # Fall Equinox
+
+    # Convert dates from any year to 2012 dates
+    d <- as.Date(strftime(DATES, format="2012-%m-%d"))
+
+    ifelse (d >= WS | d < SE, "Winter",
+      ifelse (d >= SE & d < SS, "Spring",
+        ifelse (d >= SS & d < FE, "Summer", "Fall")))
+}
+
+# Function to create the Air Qualtiy Index (AQI)
+aqi <- function(d.in) {
+  
+  O3_index <- NA
+  PM10_index <- NA
+  PM25_index <- NA
+  NO2_index <- NA
+  
+  if(is.na(d.in$O3)){
+    O3_index <- 0
+  }
+  else if (d.in$O3>100){
+    O3_index <- 4
+  }
+  else if (d.in$O3 >= 67){
+    O3_index <- 3
+  }
+  else if (d.in$O3 >= 34){
+    O3_index <- 2
+  }
+  else{
+    O3_index <- 1
+  }
+  if(is.na(d.in$PM10)){
+    PM10_index <- 0
+  }
+  else if (d.in$PM10 >= 59){
+    PM10_index <- 5
+  }
+  else if (d.in$PM10 >= 51){
+    PM10_index <- 4
+  }
+  else if (d.in$PM10 >= 34){
+    PM10_index <- 3
+  }
+  else if (d.in$PM10 >= 17){
+    PM10_index <- 2
+  }
+  else{
+    PM10_index <- 1
+  }
+  if (is.na(d.in$PM25)){
+    PM25_index <- 0
+  }
+  else if (d.in$PM25 >= 48){
+    PM25_index <- 6
+  }
+  else if (d.in$PM25 >= 42){
+    PM25_index <- 5
+  }
+  else if (d.in$PM25 >= 36){
+    PM25_index <- 4
+  }
+  else if (d.in$PM25 >= 24){
+    PM25_index <- 3
+  }
+  else if (d.in$PM25 >= 12){
+    PM25_index <- 2
+  }
+  else{
+    PM25_index <- 1
+  }
+  if (is.na(d.in$NO2)){
+    NO2_index <- 0
+  }
+  else if (d.in$NO2 >= 68){
+    NO2_index <- 2
+  }
+  else{
+    NO2_index <- 1
+  }
+  
+  result <- max(O3_index, PM10_index, PM25_index, NO2_index)
+  
+  return(result)
+  
+}
+
+d.in <- read.csv("C:/Users/TDeegan/Desktop/Applied Data Analysis/Final Project/train.csv", header = TRUE)
+
+regions <- read.csv("C:/Users/TDeegan/Desktop/Applied Data Analysis/Final Project/regions.csv", header = TRUE)
+
+#summary(d.in)
+
+# Data wrangling
+d.in <- d.in %>% mutate(Id = as.factor(Id),
+                        region = as.factor(region),
+                        date = mdy(date),
+                        mortality_rate = as.numeric(mortality_rate),
+                        O3 = as.numeric(O3),
+                        PM10 = as.numeric(PM10),
+                        PM25 = as.numeric(PM25),
+                        NO2 = as.numeric(NO2),
+                        T2M = as.numeric(T2M))
+
+# Let's get the Mean and SD for each of our base predictors
+O3.avg <- d.in %>% select(O3) %>% filter(!is.na(.)) %>% unlist() %>% mean
+O3.sd <- d.in %>% select(O3) %>% filter(!is.na(.)) %>% unlist() %>% sd
+
+NO2.avg <- d.in %>% select(NO2) %>% filter(!is.na(.)) %>% unlist() %>% mean
+NO2.sd <- d.in %>% select(NO2) %>% filter(!is.na(.)) %>% unlist() %>% sd
+
+PM10.avg <- d.in %>% select(PM10) %>% filter(!is.na(.)) %>% unlist() %>% mean
+PM10.sd <- d.in %>% select(PM10) %>% filter(!is.na(.)) %>% unlist() %>% sd
+
+PM25.avg <- d.in %>% select(PM25) %>% filter(!is.na(.)) %>% unlist() %>% mean
+PM25.sd <- d.in %>% select(PM25) %>% filter(!is.na(.)) %>% unlist() %>% sd
+
+T2M.avg <- d.in %>% select(T2M) %>% filter(!is.na(.)) %>% unlist() %>% mean
+T2M.sd <- d.in %>% select(T2M) %>% filter(!is.na(.)) %>% unlist() %>% sd
+
+# Determine quartiles for each base predictor to determine categorey splits for feature engineering.
+# Adapative Binning purposes.
+O3.qaurtile <- quantile(eval(parse(text = "d.in %>% select(O3) %>% filter(!is.na(.)) %>% unlist()")))
+NO2.quartile <- quantile(eval(parse(text = "d.in %>% select(NO2) %>% filter(!is.na(.)) %>% unlist()")))
+PM10.quartile <- quantile(eval(parse(text = "d.in %>% select(PM10) %>% filter(!is.na(.)) %>% unlist()")))
+PM25.quartile <- quantile(eval(parse(text = "d.in %>% select(PM25) %>% filter(!is.na(.)) %>% unlist()")))
+T2M.quartile <- quantile(eval(parse(text = "d.in %>% select(T2M) %>% filter(!is.na(.)) %>% unlist()")))
+
+# Dataset with imputed values for NAs using kNN imputation approach
+# We can't scale categorical variables. No date, No id(there are many), No response variable
+d.in.imputed <- knnImputation(d.in[, !names(d.in) %in% c("Id", "date", "mortality_rate")], k=7)
+d.in.two <- d.in[, names(d.in) %in% c("Id", "date", "mortality_rate")] 
+d.in.imputed <- bind_cols(d.in.two, d.in.imputed)
+
+# Feature Engineering on d.in (non-imputed dataframe): Adaptive Binning - building categorical features for each predictor based on predictor quartiles
+d.in$O3_Level[d.in$O3 > 55.88100] <- "O3_High"
+d.in$O3_Level[d.in$O3 > 35.07425 & d.in$O3 <= 55.88100] <- "O3_Moderate"
+d.in$O3_Level[d.in$O3 <= 35.07425] <- "O3_Low"
+
+d.in$NO2_Level[d.in$NO2 > 15.858] <- "NO2_High"
+d.in$NO2_Level[d.in$NO2 > 6.056 & d.in$NO2 <= 15.858] <- "NO2_Moderate"
+d.in$NO2_Level[d.in$NO2 <= 6.056] <- "NO2_Low"
+
+d.in$PM10_Level[d.in$PM10 > 16.58900] <- "PM10_High"
+d.in$PM10_Level[d.in$PM10 > 8.65625 & d.in$PM10 <= 16.58900] <- "PM10_Moderate"
+d.in$PM10_Level[d.in$PM10 <= 8.65625] <- "PM10_Low"
+
+d.in$PM25_Level[d.in$PM25 > 9.3265] <- "PM25_High"
+d.in$PM25_Level[d.in$PM25 > 3.6240 & d.in$PM25 <= 9.3265] <- "PM25_Moderate"
+d.in$PM25_Level[d.in$PM25 <= 3.6240] <- "PM25_Low"
+
+d.in$T2M_Level[d.in$T2M > 287.2405] <- "T2M_High"
+d.in$T2M_Level[d.in$T2M > 279.3215 & d.in$T2M <= 287.2405] <- "T2M_Moderate"
+d.in$T2M_Level[d.in$T2M <= 279.3215] <- "T2M_Low"
+
+# Feature engineer a Season variable
+d.in$Season <- sapply(d.in$date, function(x) getSeason(x))
+
+# Feature engineer an AQI index variable
+for(i in 1:nrow(d.in)) 
+{
+  d.in[i,16] <- aqi(d.in[i,])
+}
+
+names(d.in)[names(d.in) == 'V16'] <- 'AQI'
+
+# Ensure factor variables are as such in the dataset
+d.in <- d.in %>% mutate(O3_Level = as.factor(O3_Level),
+                        NO2_Level = as.factor(NO2_Level),
+                        PM10_Level = as.factor(PM10_Level),
+                        PM25_Level = as.factor(PM25_Level),
+                        T2M_Level = as.factor(T2M_Level),
+                        Season = as.factor(Season),
+                        AQI = as.factor(AQI))
+# --------------------------------------------------------------------------------------
+# Feature Engineering on d.in.imputed (imputed dataframe): Adaptive Binning - building categorical features for each predictor based on predictor quartiles
+d.in.imputed$O3_Level[d.in.imputed$O3 > 55.88100] <- "O3_High"
+d.in.imputed$O3_Level[d.in.imputed$O3 > 35.07425 & d.in.imputed$O3 <= 55.88100] <- "O3_Moderate"
+d.in.imputed$O3_Level[d.in.imputed$O3 <= 35.07425] <- "O3_Low"
+
+d.in.imputed$NO2_Level[d.in.imputed$NO2 > 15.858] <- "NO2_High"
+d.in.imputed$NO2_Level[d.in.imputed$NO2 > 6.056 & d.in.imputed$NO2 <= 15.858] <- "NO2_Moderate"
+d.in.imputed$NO2_Level[d.in.imputed$NO2 <= 6.056] <- "NO2_Low"
+
+d.in.imputed$PM10_Level[d.in.imputed$PM10 > 16.58900] <- "PM10_High"
+d.in.imputed$PM10_Level[d.in.imputed$PM10 > 8.65625 & d.in.imputed$PM10 <= 16.58900] <- "PM10_Moderate"
+d.in.imputed$PM10_Level[d.in.imputed$PM10 <= 8.65625] <- "PM10_Low"
+
+d.in.imputed$PM25_Level[d.in.imputed$PM25 > 9.3265] <- "PM25_High"
+d.in.imputed$PM25_Level[d.in.imputed$PM25 > 3.6240 & d.in.imputed$PM25 <= 9.3265] <- "PM25_Moderate"
+d.in.imputed$PM25_Level[d.in.imputed$PM25 <= 3.6240] <- "PM25_Low"
+
+d.in.imputed$T2M_Level[d.in.imputed$T2M > 287.2405] <- "T2M_High"
+d.in.imputed$T2M_Level[d.in.imputed$T2M > 279.3215 & d.in.imputed$T2M <= 287.2405] <- "T2M_Moderate"
+d.in.imputed$T2M_Level[d.in.imputed$T2M <= 279.3215] <- "T2M_Low"
+
+# Feature engineer a Season variable
+d.in.imputed$Season <- sapply(d.in.imputed$date, function(x) getSeason(x))
+
+# Feature engineer an AQI index variable
+for(i in 1:nrow(d.in.imputed)) 
+{
+  d.in.imputed[i,16] <- aqi(d.in.imputed[i,])
+}
+
+names(d.in.imputed)[names(d.in.imputed) == 'V16'] <- 'AQI'
+
+# Ensure factor variables are as such in the dataset
+d.in.imputed <- d.in.imputed %>% mutate(O3_Level = as.factor(O3_Level),
+                                        NO2_Level = as.factor(NO2_Level),
+                                        PM10_Level = as.factor(PM10_Level),
+                                        PM25_Level = as.factor(PM25_Level),
+                                        T2M_Level = as.factor(T2M_Level),
+                                        Season = as.factor(Season),
+                                        AQI = as.factor(AQI))
+# --------------------------------------------------------------------------------------
+# Dataset with all NAs removed - for the first round of modeling
+d.in.complete <- d.in[complete.cases(d.in),]
+# --------------------------------------------------------------------------------------
+# Engineering binary features for each category for each categorical variable so we can use the categorical variables in our neural network
+Region.flags.complete <- data.frame(Reduce(cbind, lapply(levels(d.in.complete$region), function(x) {(d.in.complete$region == x)*1})))
+names(Region.flags.complete) = levels(d.in.complete$region)
+d.in.complete = cbind(d.in.complete, Region.flags.complete)
+
+O3.flags.complete <- data.frame(Reduce(cbind, lapply(levels(d.in.complete$O3_Level), function(x) {(d.in.complete$O3_Level == x)*1})))
+names(O3.flags.complete) = levels(d.in.complete$O3_Level)
+d.in.complete = cbind(d.in.complete, O3.flags.complete)
+
+NO2.flags.complete <- data.frame(Reduce(cbind, lapply(levels(d.in.complete$NO2_Level), function(x) {(d.in.complete$NO2_Level == x)*1})))
+names(NO2.flags.complete) = levels(d.in.complete$NO2_Level)
+d.in.complete = cbind(d.in.complete, NO2.flags.complete)
+
+PM10.flags.complete <- data.frame(Reduce(cbind, lapply(levels(d.in.complete$PM10_Level), function(x) {(d.in.complete$PM10_Level == x)*1})))
+names(PM10.flags.complete) = levels(d.in.complete$PM10_Level)
+d.in.complete = cbind(d.in.complete, PM10.flags.complete)
+
+PM25.flags.complete <- data.frame(Reduce(cbind, lapply(levels(d.in.complete$PM25_Level), function(x) {(d.in.complete$PM25_Level == x)*1})))
+names(PM25.flags.complete) = levels(d.in.complete$PM25_Level)
+d.in.complete = cbind(d.in.complete, PM25.flags.complete)
+
+T2M.flags.complete <- data.frame(Reduce(cbind, lapply(levels(d.in.complete$T2M_Level), function(x) {(d.in.complete$T2M_Level == x)*1})))
+names(T2M.flags.complete) = levels(d.in.complete$T2M_Level)
+d.in.complete = cbind(d.in.complete, T2M.flags.complete)
+
+Season.flags.complete <- data.frame(Reduce(cbind, lapply(levels(d.in.complete$Season), function(x) {(d.in.complete$Season == x)*1})))
+names(Season.flags.complete) = levels(d.in.complete$Season)
+d.in.complete = cbind(d.in.complete, Season.flags.complete)
+
+Region.flags.imputed <- data.frame(Reduce(cbind, lapply(levels(d.in.imputed$region), function(x) {(d.in.imputed$region == x)*1})))
+names(Region.flags.imputed) = levels(d.in.imputed$region)
+d.in.imputed = cbind(d.in.imputed, Region.flags.imputed)
+
+O3.flags.imputed <- data.frame(Reduce(cbind, lapply(levels(d.in.imputed$O3_Level), function(x) {(d.in.imputed$O3_Level == x)*1})))
+names(O3.flags.imputed) = levels(d.in.imputed$O3_Level)
+d.in.imputed = cbind(d.in.imputed, O3.flags.imputed)
+
+NO2.flags.imputed <- data.frame(Reduce(cbind, lapply(levels(d.in.imputed$NO2_Level), function(x) {(d.in.imputed$NO2_Level == x)*1})))
+names(NO2.flags.imputed) = levels(d.in.imputed$NO2_Level)
+d.in.imputed = cbind(d.in.imputed, NO2.flags.imputed)
+
+PM10.flags.imputed <- data.frame(Reduce(cbind, lapply(levels(d.in.imputed$PM10_Level), function(x) {(d.in.imputed$PM10_Level == x)*1})))
+names(PM10.flags.imputed) = levels(d.in.imputed$PM10_Level)
+d.in.imputed = cbind(d.in.imputed, PM10.flags.imputed)
+
+PM25.flags.imputed<- data.frame(Reduce(cbind, lapply(levels(d.in.imputed$PM25_Level), function(x) {(d.in.imputed$PM25_Level == x)*1})))
+names(PM25.flags.imputed) = levels(d.in.imputed$PM25_Level)
+d.in.imputed = cbind(d.in.imputed, PM25.flags.imputed)
+
+T2M.flags.imputed <- data.frame(Reduce(cbind, lapply(levels(d.in.imputed$T2M_Level), function(x) {(d.in.imputed$T2M_Level == x)*1})))
+names(T2M.flags.imputed) = levels(d.in.imputed$T2M_Level)
+d.in.imputed = cbind(d.in.imputed, T2M.flags.imputed)
+
+Season.flags.imputed <- data.frame(Reduce(cbind, lapply(levels(d.in.imputed$Season), function(x) {(d.in.imputed$Season == x)*1})))
+names(Season.flags.imputed) = levels(d.in.imputed$Season)
+d.in.imputed = cbind(d.in.imputed, Season.flags.imputed)
+
+rm(d.in.two, O3.flags.complete, NO2.flags.complete, PM10.flags.complete, PM25.flags.complete, T2M.flags.complete, O3.flags.imputed, NO2.flags.imputed, 
+   PM10.flags.imputed, PM25.flags.imputed, T2M.flags.imputed, Season.flags.imputed, Season.flags.complete, Region.flags.complete, Region.flags.imputed)
+```
+
+## Abstract
+
+- New estimates from the World Health Organization indicate that air pollution levels remain alarmingly high throughout the world.  
+
+- An estimated nine out of ten individuals breathe polluted air on a daily basis causing an estimated seven million premature deaths annually from ambient and household air pollution.  
+
+- The objective of our project is to use daily averages of air quality data and temperature to accurately predict mortality rates throughout regions of England.
+
+## Background
+
+- Kaggle
+    - Copernicus Atmosphere Monitoring Service (pollution)
+    - UK Office for National Statistics (Mortality Rates)
+    - n = 18,403 (6,570 samples with partially complete data)
+    - Seven features (Region, Date, Temperature, 4 Major Pollutants)
+
+## Data Dictionary
+
+- Id: Unique identification number for each row
+- region: One of the nine official regions of England
+- date: 1/2/2007 - 12/31/2012
+- O3: Ozone, daily average ($\mu$g/$m^3$)
+- PM10: Particulate matter, 10$\mu$m or less in diameter, daily average ($\mu$g/$m^3$)
+- PM25: Particulate matter, 2.5$\mu$m or less in diameter, daily average ($\mu$g/$m^3$)
+- NO2: Nitrogen dioxide, daily average ($\mu$g/$m^3$)
+- T2M: Temperature (Kelvin) 2m above ground, daily average 
+- mortality_rate: Deaths per 100,000 people
+
+## Preliminary Feature Engineering (1/2)
+
+- Pollutants and Temperature
+    - Attempt to extract additional value from dataset by partitioning continuous values into three categories (Low, Moderate, High).
+        - Low (Below 25th Percentile)
+        - Moderate (25th - 75th Percentile)
+        - High (Above 75th Percentile)
+- Date
+    - Partitioned into Winter, Spring, Summer, Fall
+    
+## Preliminary Feature Engineering (2/2)
+
+- Air Quality Index (AQI)
+    - Recommended by UK's Committee on Medical Effects of Air Pollutants
+    - Numeric value from 1 to 10 (1 Highest Quality Air, 10 Lowest Quality Air)
+    - Based on concentration of pollutants
+    
+## Table 1 - Region
+Region    | Mortality Rate 1.30 (.30)
+---------|---------|
+North East    |1.47 (.32)      |
+North West|1.43 (.26)      |  
+Yorkshire and The Humber |1.38 (.26)      |  
+East Midlands |1.28 (.27)      | 
+West Midlands |1.28 (.26)      | 
+East of England |1.27 (.24)      | 
+London |0.88 (.18)      | 
+South East |1.26 (.24)      | 
+South West |1.40 (.28)      |
+
+## Table 1 - Ozone Level
+
+Ozone Level	| Mortality Rate 1.30 (.30)
+----------|---------------|
+High (n=4598)	|1.31 (.25)|
+Moderate (n=9197)	|1.27 (.29)|
+Low (n=4599)	|1.35 (.26)|
+
+## Table 1 - Nitrogen Dioxide Level
+
+NO2 Level	| Mortality Rate 1.30 (.30)
+----------|---------------|
+High (n=2958)	|1.24 (.36)|
+Moderate (n=5915)	|1.27 (.27)|
+Low (n=2960)	|1.27 (.26)|
+
+## Table 1 - Particulate Matter 10 Level
+
+PM10 Level	| Mortality Rate 1.30 (.30)
+----------|---------------|
+High (n=4598)	|1.27 (.31)|
+Moderate (n=9197)	|1.29 (.30)|
+Low (n=4599)	|1.36 (.30)|
+
+## Table 1 - Particulate Matter 2.5 Level
+
+PM25 Level	| Mortality Rate 1.30 (.30)
+----------|---------------|
+High (n=3782)	|1.26 (.31)|
+Moderate (n=7562)	|1.27 (.30)|
+Low (n=3783)	|1.34 (.29)|
+
+## Table 1 - Temperature (Kelvin) Level
+
+Temp Level	| Mortality Rate 1.30 (.30)
+----------|---------------|
+High (n=4601)	|1.12 (.22)|
+Moderate (n=9201)	|1.29 (.27)|
+Low (n=4601)	|1.50 (.32)|
+
+## Table 1 - Season
+
+Season	| Mortality Rate 1.30 (.30)| AQI 2.00 (.50)
+--------|---------------|------|
+Winter (n=4579)	|1.54 (.33)| 1.90 (0.49)|
+Spring (n=4674)	|1.27 (.25)|2.34 (0.51)   |
+Summer (n=4600)	|1.12 (.22)|   1.96 (.33)|
+Fall   (n=4550) |1.28 (.26)|  1.78 (.47)   |
+
+## Table 1 - AQI
+
+AQI	| Mortality Rate 1.30 (.30)
+----------|---------------|
+Index 1 (n=2272) | 1.38 (.38)|
+Index 2 (n=13970)| 1.29 (.30)|
+Index 3 (n=2101)| 1.30 (.26)|
+Index 4 (n=49)| 1.22 (.24)|
+Index 5 (n=11)|1.18 (.21) |
+
+## Exploratory Data Analysis
+
+```{r date, warning=FALSE}
+g.date <- d.in %>%
+  ggplot(aes(x=date, y=mortality_rate)) + geom_point() + labs(title="Mortality Rate by Date",x="Date",y="Mortality Rate per 100K people")
+plot(g.date)
+```
+
+## Exploratory Data Analysis
+
+```{r temp, warning=FALSE}
+g.temp <- d.in %>%
+  ggplot(aes(x=T2M, y=mortality_rate)) + geom_point() + labs(title="Mortality Rate by Temperature in Kelvin",x="Temperature, Daily Average (2m above ground)",y="Mortality Rate per 100K people")
+plot(g.temp)
+```
+
+## Exploratory Data Analysis
+
+```{r season, warning=FALSE}
+g.season <- ggplot(d.in, aes(y=mortality_rate, x=Season, fill = Season)) + geom_boxplot(outlier.colour="black", outlier.shape=16,outlier.size = 2, notch=FALSE) +
+theme_classic() + labs(title="Mortality Rate by Season",x="Season",y="Mortality Rate per 100k People")
+plot(g.season)
+```
+
+## Exploratory Data Analysis
+
+```{r temp_level, warning=FALSE}
+g.temp_level <- ggplot(d.in, aes(y=mortality_rate, x=T2M_Level, fill = T2M_Level)) + geom_boxplot(outlier.colour="black", outlier.shape=16,outlier.size = 2, notch=FALSE) +
+theme_classic() + labs(title="Mortality Rate by Temp Level",x="Temperature Level",y="Mortality Rate per 100k People")
+plot(g.temp_level)
+```
+
+## Exploratory Data Analysis
+
+```{r NO2, warning=FALSE}
+g.NO2 <- d.in %>%
+  ggplot(aes(x=NO2, y=mortality_rate)) + geom_point() + labs(title="Mortality Rate by Nitrogen Dioxide",x="Nitrogen Dioxide",y="Mortality Rate per 100K people")
+plot(g.NO2)
+```
+
+## Exploratory Data Analysis
+
+```{r O3, warning=FALSE}
+g.O3 <- d.in %>%
+  ggplot(aes(x=O3, y=mortality_rate)) + geom_point() + labs(title="Mortality Rate by Ozone",x="Ozone",y="Mortality Rate per 100K people")
+plot(g.O3)
+```
+
+## Exploratory Data Analysis
+
+```{r PM10, warning=FALSE}
+g.PM10 <- d.in %>%
+  ggplot(aes(x=PM10, y=mortality_rate)) + geom_point() + labs(title="Mortality Rate by PM10",x="PM10",y="Mortality Rate per 100K people")
+plot(g.PM10)
+```
+
+## Exploratory Data Analysis
+
+```{r PM25, warning=FALSE}
+g.PM25 <- d.in %>%
+  ggplot(aes(x=PM25, y=mortality_rate)) + geom_point() + labs(title="Mortality Rate by PM 2.5",x="Particulate Matter (2.5)",y="Mortality Rate per 100K people")
+plot(g.PM25)
+```
+
+## Exploratory Data Analysis
+
+```{r AQI, warning=FALSE}
+g.AQI <- ggplot(d.in, aes(y=mortality_rate, x=AQI, fill = AQI)) + geom_boxplot(outlier.colour="black", outlier.shape=16,outlier.size = 2, notch=FALSE) +
+theme_classic() + labs(title="Mortality Rate by AQI",x="Air Quality Index",y="Mortality Rate per 100k People")
+plot(g.AQI)
+```
+
+## Exploratory Data Analysis - Region
+
+```{r region, warning=FALSE}
+d.in.region <- d.in
+
+levels(d.in.region$region) <- c(levels(d.in.region$region), "North East","North West","Yorkshire and The Humber","East Midlands","West Midlands","East of England","London","South East","South West")
+
+d.in.region$region[d.in.region$region == 'E12000001'] <- 'North East'
+d.in.region$region[d.in.region$region == 'E12000002'] <- 'North West'
+d.in.region$region[d.in.region$region == 'E12000003'] <- 'Yorkshire and The Humber'
+d.in.region$region[d.in.region$region == 'E12000004'] <- 'East Midlands'
+d.in.region$region[d.in.region$region == 'E12000005'] <- 'West Midlands'
+d.in.region$region[d.in.region$region == 'E12000006'] <- 'East of England'
+d.in.region$region[d.in.region$region == 'E12000007'] <- 'London'
+d.in.region$region[d.in.region$region == 'E12000008'] <- 'South East'
+d.in.region$region[d.in.region$region == 'E12000009'] <- 'South West'
+
+g.region <- ggplot(d.in.region, aes(y=mortality_rate, x=region, fill = region)) + geom_boxplot(outlier.colour="black", outlier.shape=16,outlier.size = 2, notch=FALSE) +
+theme_classic() + labs(title="Mortality Rate by Region",x="Region",y="Mortality Rate per 100k People") + theme(axis.text.x = element_text(angle = 45, hjust = 1))
+plot(g.region)
+```
+
+## Modelling Progression
+
+- Simple Linear Regression
+- Multiple Linear Regression
+- Random Forests
+- Artificial Neural Networks
+
+## Regression
+
+ Model         |     Train/Test Data Split     |     Data PreProcessing     |     Model Accuracy  
+ --------------|-------------------------------|----------------------------|--------------------
+ LM1           |             70-30             |     NA Records Omitted    |      0.5959228     
+ LM2           |             70-30             |     kNN Imputation         |      0.5731310
+ LM3           |             80-20             |     NA Records Omitted    |      0.5966913
+ LM4           |             80-20             |     kNN Imputation         |      0.5619385
+ 
+## Regression Analysis (1/2)
+
+```{r raAll, out.width = "500px", out.height = "500px", fig.align="center"}
+knitr::include_graphics("residual_plot_pollutants.png")
+```
+
+## Regression Analysis (2/2)
+
+```{r raO3, out.width = "400px", fig.align="center"}
+knitr::include_graphics("residual_plot_O3.png")
+```
+
+## Random Forests
+
+ Model         |     Train/Test Data Split     |     Data PreProcessing     |     Model Accuracy  
+ --------------|-------------------------------|----------------------------|--------------------
+ RF1           |             70-30             |     NA Records Omitted    |      0.7704970     
+ RF2           |             70-30             |     kNN Imputation         |      0.7572889
+ RF3           |             80-20             |     NA Records Omitted    |      0.7639935
+ RF4           |             80-20             |     kNN Imputation         |      0.7485153
+
+## Variable Importance
+
+```{r, out.width = "400px", fig.align="center"}
+knitr::include_graphics("variable_importance.png")
+```
+
+## Artificial Neural Networks
+
+ Model         |     Train/Test Data Split     |     Data PreProcessing     |     Model Accuracy  
+ --------------|-------------------------------|----------------------------|--------------------
+ NN1           |             70-30             |     NA Records Omitted    |       0.7673420     
+ NN2           |             70-30             |     kNN Imputation         |      0.7539171
+ NN3           |             80-20             |     NA Records Omitted    |       0.7759289
+ NN4           |             80-20             |     kNN Imputation         |      0.7455035
+
+## Modelling Performance
+
+```{r model_performance, warning=FALSE}
+d.results <- data.frame(Model = as.character(),
+                     Train_Test_Split = as.character(),
+                     Data_Set_Preprocessing = as.character(),
+                     Accuracy = as.numeric())
+
+d.results <- rbind(d.results, data.frame(Model = as.character("LM1"), Train_Test_Split = as.character("70-30"), Data_Set_Preprocessing = as.character("NA Recoreds Omitted"), Accuracy = as.numeric(0.5959228)))
+d.results <- rbind(d.results, data.frame(Model = as.character("LM2"), Train_Test_Split = as.character("70-30"), Data_Set_Preprocessing = as.character("kNN Imputation"), Accuracy = as.numeric(0.5731310)))
+d.results <- rbind(d.results, data.frame(Model = as.character("LM3"), Train_Test_Split = as.character("80-20"), Data_Set_Preprocessing = as.character("NA Recoreds Omitted"), Accuracy = as.numeric(0.5966913)))
+d.results <- rbind(d.results, data.frame(Model = as.character("LM4"), Train_Test_Split = as.character("80-20"), Data_Set_Preprocessing = as.character("kNN Imputation"), Accuracy = as.numeric(0.5619385)))
+d.results <- rbind(d.results, data.frame(Model = as.character("RF1"), Train_Test_Split = as.character("70-30"), Data_Set_Preprocessing = as.character("NA Recoreds Omitted"), Accuracy = as.numeric(0.7704970)))
+d.results <- rbind(d.results, data.frame(Model = as.character("RF2"), Train_Test_Split = as.character("70-30"), Data_Set_Preprocessing = as.character("kNN Imputation"), Accuracy = as.numeric(0.7572889)))
+d.results <- rbind(d.results, data.frame(Model = as.character("RF3"), Train_Test_Split = as.character("80-20"), Data_Set_Preprocessing = as.character("NA Recoreds Omitted"), Accuracy = as.numeric(0.7639935)))
+d.results <- rbind(d.results, data.frame(Model = as.character("RF4"), Train_Test_Split = as.character("80-20"), Data_Set_Preprocessing = as.character("kNN Imputation"), Accuracy = as.numeric(0.7485153)))
+d.results <- rbind(d.results, data.frame(Model = as.character("NN1"), Train_Test_Split = as.character("70-30"), Data_Set_Preprocessing = as.character("NA Recoreds Omitted"), Accuracy = as.numeric(0.7673420)))
+d.results <- rbind(d.results, data.frame(Model = as.character("NN2"), Train_Test_Split = as.character("70-30"), Data_Set_Preprocessing = as.character("kNN Imputation"), Accuracy = as.numeric(0.7539171)))
+d.results <- rbind(d.results, data.frame(Model = as.character("NN3"), Train_Test_Split = as.character("80-20"), Data_Set_Preprocessing = as.character("NA Recoreds Omitted"), Accuracy = as.numeric(0.7759289)))
+d.results <- rbind(d.results, data.frame(Model = as.character("NN4"), Train_Test_Split = as.character("80-20"), Data_Set_Preprocessing = as.character("kNN Imputation"), Accuracy = as.numeric(0.7455035)))
+
+p <- ggplot(d.results, aes(y = Accuracy, x = Model, fill = Train_Test_Split)) + geom_col() + ggtitle("Model Performance") + theme_classic()
+
+plot(p)
+#############################################################
+
+  
+  #See codebase below for modelling to support these figures
+  
+  
+#############################################################
+```
+
+## Strengths / Weaknesses / Conclusion
+
+```{r commented_out, warning=FALSE}
+# --------------------------------------------------------------------------------------
+### ANN ###
+# 1. Split data into Training and Test
+#     a. 70/30
+#     b. 80/20
+# 2. ANN
+#     a. internal network size: 2 - 25 w/ constant decay
+# 3. Repeat steps 1. and 2. for the imputed dataset
+
+# Running ANN on removed incomplete records data set
+
+# calculate_rmse <- function(d){
+#   # function to calculate rmse
+#   rmse <- sqrt(mean((d$predicted_rate - d$actual_rate)^2))
+#   return(rmse) 
+# }
+
+# Normalizing the dataset so values fall between [0, 1]
+# scale01 <- function(x){
+#   (x - min(x)) / (max(x) - min(x))
+# }
+# 
+# # Scale the data in the d.in.complete data set
+# d.in.complete.scaled <- d.in.complete %>% 
+#   select(O3, NO2, PM10, PM25, T2M, mortality_rate) %>%
+#   mutate_all(scale01)
+
+# d.in.complete.scaled <- as.data.frame(scale(d.in.complete[c("O3", "NO2", "PM10", "PM25", "T2M", "mortality_rate")]))
+# d.col.diff <- d.in.complete[, !names(d.in.complete) %in% c("O3", "NO2", "PM10", "PM25", "T2M", "mortality_rate")]
+# d.in.complete.scaled <- bind_cols(d.col.diff, d.in.complete.scaled)
+# 
+# # Scale the data in the d.in.imputed data set
+# d.in.imputed.scaled <- d.in.imputed %>% 
+#   select(O3, NO2, PM10, PM25, T2M, mortality_rate) %>%
+#   mutate_all(scale01)
+# 
+# # d.in.complete.scaled <- as.data.frame(scale(d.in.complete[c("O3", "NO2", "PM10", "PM25", "T2M", "mortality_rate")]))
+# d.col.diff <- d.in.imputed[, !names(d.in.imputed) %in% c("O3", "NO2", "PM10", "PM25", "T2M", "mortality_rate")]
+# d.in.imputed.scaled <- bind_cols(d.col.diff, d.in.imputed.scaled)
+# 
+# # Creating the 70/30 Train/Test split on d.in.complete
+# set.seed(123)
+# 
+# train_index_70_30_complete <- createDataPartition(d.in.complete.scaled$mortality_rate, p = .7, list = FALSE, times = 1)
+# train_index_70_30_imputed <- createDataPartition(d.in.imputed.scaled$mortality_rate, p = .7, list = FALSE, times = 1)
+
+# d.train.complete.70.30 <- d.in.complete.scaled[train_index_70_30_complete,]
+# d.test.complete.70.30 <- d.in.complete.scaled[-train_index_70_30_complete,]
+# 
+# d.train.imputed.70.30 <- d.in.imputed.scaled[train_index_70_30_imputed,]
+# d.test.imputed.70.30 <- d.in.imputed.scaled[-train_index_70_30_imputed,]
+# 
+# # Due to computing resource limitations on the development machine, tuning parameters will not be as comprehensive.
+# fitControl <- trainControl(method = "cv", number = 5) # try number = 5, 7
+# nnetGrid <- expand.grid(size = seq(from = 2, to = 25, by = 1),
+#                         decay = c(5e-4)) # decay = c(0.5, 0.1, 1e-2, 1e-3, 1e-4, 1e-5, 1e-6, 1e-7)
+# 
+# ann.1 <- train(mortality_rate ~ O3 + NO2 + PM10 + PM25 + T2M + AQI + E12000001 + E12000002 + E12000003 + E12000004 + E12000005 + E12000006 + E12000007 + E12000008
+#                + E12000009 + O3_High + O3_Moderate + O3_Low + NO2_High + NO2_Moderate + NO2_Low + PM10_High + PM10_Moderate + PM10_Low + PM25_High + PM25_Moderate
+#                + PM25_Low + T2M_High + T2M_Moderate + T2M_Low + Fall + Spring + Summer + Winter,
+#                data = d.train.complete.70.30,
+#                method = "nnet",
+#                trControl = fitControl,
+#                tuneGrid = nnetGrid,
+#                trace = FALSE,
+#                maxit = 200,
+#                linout = 1)
+
+# ann.2 <- train(mortality_rate ~ O3 + NO2 + PM10 + PM25 + T2M + AQI + E12000001 + E12000002 + E12000003 + E12000004 + E12000005 + E12000006 + E12000007 + E12000008
+#                + E12000009 + O3_High + O3_Moderate + O3_Low + NO2_High + NO2_Moderate + NO2_Low + PM10_High + PM10_Moderate + PM10_Low + PM25_High + PM25_Moderate
+#                + PM25_Low + T2M_High + T2M_Moderate + T2M_Low + Fall + Spring + Summer + Winter,
+#                data = d.train.imputed.70.30,
+#                method = "nnet",
+#                trControl = fitControl,
+#                tuneGrid = nnetGrid,
+#                trace = FALSE,
+#                maxit = 200,
+#                linout = 1)
+# 
+# d.rmse <- data.frame(Model = as.character(),
+#                      Train_Test_Split = as.character(),
+#                      Data_Set_Preprocessing = as.character(),
+#                      RMSE = as.numeric(),
+#                      Accuracy = as.numeric())
+# 
+# d.temp.complete.7030 <- d.test.complete.70.30
+# d.temp.complete.7030$pred_mortality_rate <- predict(ann.1, newdata = d.temp.complete.7030)
+# d.temp.complete.7030$actual_rate <- d.temp.complete.7030$mortality_rate
+# d.temp.complete.7030$predicted_rate <- d.temp.complete.7030$pred_mortality_rate
+# h.rmse.complete.7030 <- calculate_rmse(d.temp.complete.7030)
+
+# d.temp.imputed.7030 <- d.test.imputed.70.30
+# d.temp.imputed.7030$pred_mortality_rate <- predict(ann.2, newdata = d.temp.imputed.7030)
+# d.temp.imputed.7030$actual_rate <- d.temp.imputed.7030$mortality_rate
+# d.temp.imputed.7030$predicted_rate <- d.temp.imputed.7030$pred_mortality_rate
+# h.rmse.imputed.7030 <- calculate_rmse(d.temp.imputed.7030)
+# 
+# h.model.complete.7030 <- "NN1"
+# h.model.imputed.7030 <- "NN2"
+# h.split.7030 <- "70-30"
+# h.dataSet.complete.7030 <- "NA Recoreds Omitted"
+# h.dataSet.imputed.7030 <- "kNN Imputation"
+# 
+# acc.complete.7030 <- cor(d.temp.complete.7030$actual_rate, d.temp.complete.7030$predicted_rate)
+# acc.imputed.7030 <- cor(d.temp.imputed.7030$actual_rate, d.temp.imputed.7030$predicted_rate)
+# 
+# # store output
+# d.rmse <- rbind(d.rmse, data.frame(Model = as.character(h.model.complete.7030), Train_Test_Split = as.character(h.split.7030), Data_Set_Preprocessing = as.character(h.dataSet.complete.7030), RMSE = as.numeric(h.rmse.complete.7030), Accuracy = as.numeric(acc.complete.7030)))
+# d.rmse <- rbind(d.rmse, data.frame(Model = as.character(h.model.imputed.7030), Train_Test_Split = as.character(h.split.7030), Data_Set_Preprocessing = as.character(h.dataSet.imputed.7030), RMSE = as.numeric(h.rmse.imputed.7030), Accuracy = as.numeric(acc.imputed.7030)))
+
+# rm(d.temp.complete.7030, d.temp.imputed.7030, d.test.imputed.70.30, d.test.complete.70.30, d.train.imputed.70.30, d.train.complete.70.30)
+# --------------------------------------------------------------------------------------
+# Creating the 80/20 Train/Test split on d.in.complete
+# set.seed(234)
+# 
+# train_index_80_20_complete <- createDataPartition(d.in.complete.scaled$mortality_rate, p = .8, list = FALSE, times = 1)
+# train_index_80_20_imputed <- createDataPartition(d.in.imputed.scaled$mortality_rate, p = .8, list = FALSE, times = 1)
+
+# d.train.complete.80.20 <- d.in.complete.scaled[train_index_80_20_complete,]
+# d.test.complete.80.20 <- d.in.complete.scaled[-train_index_80_20_complete,]
+# 
+# d.train.imputed.80.20 <- d.in.imputed.scaled[train_index_80_20_imputed,]
+# d.test.imputed.80.20 <- d.in.imputed.scaled[-train_index_80_20_imputed,]
+# 
+# ann.3 <- train(mortality_rate ~ O3 + NO2 + PM10 + PM25 + T2M + AQI + E12000001 + E12000002 + E12000003 + E12000004 + E12000005 + E12000006 + E12000007 + E12000008
+#                + E12000009 + O3_High + O3_Moderate + O3_Low + NO2_High + NO2_Moderate + NO2_Low + PM10_High + PM10_Moderate + PM10_Low + PM25_High + PM25_Moderate
+#                + PM25_Low + T2M_High + T2M_Moderate + T2M_Low + Fall + Spring + Summer + Winter,
+#                data = d.train.complete.80.20,
+#                method = "nnet",
+#                trControl = fitControl,
+#                tuneGrid = nnetGrid,
+#                trace = FALSE,
+#                maxit = 200,
+#                linout = 1)
+
+# ann.4 <- train(mortality_rate ~ O3 + NO2 + PM10 + PM25 + T2M + AQI + E12000001 + E12000002 + E12000003 + E12000004 + E12000005 + E12000006 + E12000007 + E12000008
+#                + E12000009 + O3_High + O3_Moderate + O3_Low + NO2_High + NO2_Moderate + NO2_Low + PM10_High + PM10_Moderate + PM10_Low + PM25_High + PM25_Moderate
+#                + PM25_Low + T2M_High + T2M_Moderate + T2M_Low + Fall + Spring + Summer + Winter,
+#                data = d.train.imputed.80.20,
+#                method = "nnet",
+#                trControl = fitControl,
+#                tuneGrid = nnetGrid,
+#                trace = FALSE,
+#                maxit = 200,
+#                linout = 1)
+
+# d.temp.complete.8020 <- d.test.complete.80.20
+# d.temp.complete.8020$pred_mortality_rate <- predict(ann.3, newdata = d.temp.complete.8020)
+# d.temp.complete.8020$actual_rate <- d.temp.complete.8020$mortality_rate
+# d.temp.complete.8020$predicted_rate <- d.temp.complete.8020$pred_mortality_rate
+# h.rmse.complete.8020 <- calculate_rmse(d.temp.complete.8020)
+
+# d.temp.imputed.8020 <- d.test.imputed.80.20
+# d.temp.imputed.8020$pred_mortality_rate <- predict(ann.4, newdata = d.temp.imputed.8020)
+# d.temp.imputed.8020$actual_rate <- d.temp.imputed.8020$mortality_rate
+# d.temp.imputed.8020$predicted_rate <- d.temp.imputed.8020$pred_mortality_rate
+# h.rmse.imputed.8020 <- calculate_rmse(d.temp.imputed.8020)
+# 
+# h.model.complete.8020 <- "NN3"
+# h.model.imputed.8020 <- "NN4"
+# h.split.8020 <- "80-20"
+# h.dataSet.complete.8020 <- "NA Recoreds Omitted"
+# h.dataSet.imputed.8020 <- "kNN Imputation"
+# 
+# acc.complete.8020 <- cor(d.temp.complete.8020$actual_rate, d.temp.complete.8020$predicted_rate)
+# acc.imputed.8020 <- cor(d.temp.imputed.8020$actual_rate, d.temp.imputed.8020$predicted_rate)
+
+# store output
+# d.rmse <- rbind(d.rmse, data.frame(Model = as.character(h.model.complete.8020), Train_Test_Split = as.character(h.split.8020), Data_Set_Preprocessing = as.character(h.dataSet.complete.8020), RMSE = as.numeric(h.rmse.complete.8020), Accuracy = as.numeric(acc.complete.8020)))
+# d.rmse <- rbind(d.rmse, data.frame(Model = as.character(h.model.imputed.8020), Train_Test_Split = as.character(h.split.8020), Data_Set_Preprocessing = as.character(h.dataSet.imputed.8020), RMSE = as.numeric(h.rmse.imputed.8020), Accuracy = as.numeric(acc.imputed.8020)))
+# 
+# # rm(d.temp.complete.8020, d.temp.imputed.8020, d.test.imputed.80.20, d.test.complete.80.20, d.train.imputed.80.20, d.train.complete.80.20)
+# # --------------------------------------------------------------------------------------
+# p <- ggplot(d.rmse, aes(y = Accuracy, x = Model)) + geom_col() + ggtitle("Model Performance") + theme_classic()
+# 
+# plot(p)
+# --------------------------------------------------------------------------------------
+
+# Model         |     Train/Test Data Split     |     Data PreProcessing     |     Model Accuracy  
+# --------------|-------------------------------|----------------------------|--------------------
+# LM1           |             70-30             |     NA Recoreds Omitted    |      0.5959228     
+# LM2           |             70-30             |     kNN Imputation         |      0.5731310
+# LM3           |             80-20             |     NA Recoreds Omitted    |      0.5966913
+# LM4           |             80-20             |     kNN Imputation         |      0.5619385
+# RF1           |             70-30             |     NA Recoreds Omitted    |      0.7704970
+# RF2           |             70-30             |     kNN Imputation         |      0.7572889
+# RF3           |             80-20             |     NA Recoreds Omitted    |      0.7639935
+# RF4           |             80-20             |     kNN Imputation         |      0.7485153
+# NN1           |             70-30             |     NA Recoreds Omitted    |      0.7673420
+# NN2           |             70-30             |     kNN Imputation         |      0.7539171
+# NN3           |             80-20             |     NA Recoreds Omitted    |      0.7759289
+# NN4           |             80-20             |     kNN Imputation         |      0.7455035 
+
+
+#############################################################################
+#############################################################################
+#############################################################################
+
+#Linear Regression, Multiple Regression, Random Forests
+
+# # # -------------make data set for random forests -----------
+# d.complete.test_rf <- d.complete.test
+# d.imputed.test_rf <- d.imputed.test
+# 
+# d.complete.test_rf <- d.complete.test
+# d.imputed.test_rf <- d.imputed.test
+# 
+# 
+# d.complete.test_rf_8020 <- d.complete.test_8020
+# d.imputed.test_rf_8020 <- d.imputed.test_8020
+# 
+# d.complete.test_rf_8020 <- d.complete.test_8020
+# d.imputed.test_rf_8020 <- d.imputed.test_8020
+# 
+# 
+# 
+# # -----------------------------------Simple Regression-------------------------------
+# # removed NA's
+# # --------------------------------d.complete.train has NA's removed---------------------
+# # regression on complete table
+# 
+# lm.d.complete.train.O3 <- lm(mortality_rate ~ O3, data=d.complete.train)
+# confint(lm.d.complete.train.O3)
+# summary(lm.d.complete.train.O3)
+# 
+# lm.d.complete.train.PM10 <- lm(mortality_rate ~ PM10, data=d.complete.train)
+# confint(lm.d.complete.train.PM10)
+# summary(lm.d.complete.train.PM10)
+# 
+# lm.d.complete.train.PM25 <- lm(mortality_rate ~ PM25, data=d.complete.train)
+# confint(lm.d.complete.train.PM25)
+# summary(lm.d.complete.train.PM25)
+# 
+# lm.d.complete.train.NO2 <- lm(mortality_rate ~ NO2, data=d.complete.train)
+# confint(lm.d.complete.train.NO2)
+# summary(lm.d.complete.train.NO2)
+# 
+# lm.d.complete.train.T2M <- lm(mortality_rate ~ T2M, data=d.complete.train)
+# confint(lm.d.complete.train.T2M)
+# summary(lm.d.complete.train.T2M)
+# 
+# 
+# # -------------------------regression on imputed table--------------------------------
+# 
+# lm.d.imputed.train.O3 <- lm(mortality_rate ~ O3, data=d.imputed.train)
+# confint(lm.d.imputed.train.O3)   # very tight conf int --> means highly associated feature
+# summary(lm.d.imputed.train.O3)
+# 
+# lm.d.imputed.train.PM10 <- lm(mortality_rate ~ PM10, data=d.imputed.train)
+# confint(lm.d.imputed.train.PM10)
+# summary(lm.d.imputed.train.PM10)
+# 
+# lm.d.imputed.train.PM25 <- lm(mortality_rate ~ PM25, data=d.imputed.train)
+# confint(lm.d.imputed.train.PM25)
+# summary(lm.d.imputed.train.PM25)
+# 
+# lm.d.imputed.train.NO2 <- lm(mortality_rate ~ NO2, data=d.imputed.train)
+# confint(lm.d.imputed.train.NO2)
+# summary(lm.d.imputed.train.NO2)
+# 
+# lm.d.imputed.train.T2M <- lm(mortality_rate ~ T2M, data=d.imputed.train)
+# confint(lm.d.imputed.train.T2M)
+# summary(lm.d.imputed.train.T2M)
+# 
+# 
+# # do multiple reg. find the fetaure association
+# # ------------with PM25-----------
+# mlm.pm25.d.imputed.train <- lm(mortality_rate ~ NO2 + T2M + PM10 + PM25 + O3, data=d.imputed.train)
+# confint(mlm.pm25.d.imputed.train)
+# summary(mlm.pm25.d.imputed.train)
+# 
+# 
+# # -------------=======---complete----------------------------
+# mlm.pm25.d.complete.train <- lm(mortality_rate ~ NO2 + T2M + PM10 + PM25 + O3, data=d.complete.train)
+# confint(mlm.pm25.d.complete.train)
+# summary(mlm.pm25.d.complete.train)
+# 
+# 
+# # ------without PM25-------
+# mlm.d.imputed.train <- lm(mortality_rate ~ NO2 + T2M + PM10 + O3, data=d.imputed.train)
+# confint(mlm.d.imputed.train)
+# summary(mlm.d.imputed.train)
+# 
+# 
+# mlm.d.complete.train <- lm(mortality_rate ~ NO2 + T2M + PM10 + O3, data=d.complete.train)
+# confint(mlm.d.complete.train)
+# summary(mlm.d.complete.train)
+# 
+# 
+# 
+# 
+# #-----------------------------------prediction-------------------------------------------------------------------
+# # --------------------prediction with regression models----------------------------------------------------------
+# # ---------------------------d.complete.train-------------------------No NA's------------------------------------
+# 
+# # predict on individual features simple linear regression
+# 
+# # O3
+# d.complete.test$PredictedRate_O3 <-predict(lm.d.complete.train.O3, newdata = d.complete.test)
+# # Correlation between predicted and actual rate
+# cor(d.complete.test$mortality_rate, d.complete.test$PredictedRate_O3)
+# 
+# # NO2
+# d.complete.test$PredictedRate_NO2 <-predict(lm.d.complete.train.NO2, newdata = d.complete.test)
+# # Correlation between predicted and actual rate
+# cor(d.complete.test$mortality_rate, d.complete.test$PredictedRate_NO2)
+# 
+# # T2M
+# 
+# d.complete.test$PredictedRate_T2M <-predict(lm.d.complete.train.T2M, newdata = d.complete.test)
+# # Correlation between predicted and actual rate
+# cor(d.complete.test$mortality_rate, d.complete.test$PredictedRate_T2M)
+# 
+# 
+# # PM10
+# d.complete.test$PredictedRate_PM10 <-predict(lm.d.complete.train.PM10, newdata = d.complete.test)
+# # Correlation between predicted and actual rate
+# cor(d.complete.test$mortality_rate, d.complete.test$PredictedRate_PM10)
+# 
+# 
+# # PM25
+# d.complete.test$PredictedRate_PM25 <-predict(lm.d.complete.train.PM25, newdata = d.complete.test)
+# # Correlation between predicted and actual rate
+# cor(d.complete.test$mortality_rate, d.complete.test$PredictedRate_PM25)
+# 
+# 
+# 
+# # -------------------------MULTIPLE REGRESSION WITH PM25 and complete------------------------------------
+
+# d.complete.test$PredictedRate_mlm_PM25 <-predict(mlm.pm25.d.complete.train, newdata = d.complete.test)
+# # Correlation between predicted and actual rate
+# cor(d.complete.test$mortality_rate, d.complete.test$PredictedRate_mlm_PM25)
+# 
+# # --------------------without PM25--------------------------
+# d.complete.test$PredictedRate_mlm <-predict(mlm.d.complete.train, newdata = d.complete.test)
+# # Correlation between predicted and actual rate
+# cor(d.complete.test$mortality_rate, d.complete.test$PredictedRate_mlm)
+# 
+# 
+# 
+# # ---------------------------------------imputed-------------------------------------------
+# # ------------------ simple linear with imputed train dataset on test dataset(doesn't have imputations)--------------------------
+# 
+# 
+# # predict on individual features simple linear regression
+# 
+# # O3
+# d.imputed.test$PredictedRate_O3 <- predict(lm.d.imputed.train.O3,
+#                                            newdata = d.imputed.test)
+# # Correlation between predicted and actual rate
+# cor(d.imputed.test$mortality_rate, d.imputed.test$PredictedRate_O3)
+# 
+# # NO2
+# d.imputed.test$PredictedRate_NO2 <-predict(lm.d.imputed.train.NO2,
+#                                            newdata = d.imputed.test)
+# # Correlation between predicted and actual rate
+# cor(d.imputed.test$mortality_rate, d.imputed.test$PredictedRate_NO2)
+# 
+# 
+# # T2M
+# 
+# d.imputed.test$PredictedRate_T2M <-predict(lm.d.imputed.train.T2M,
+#                                            newdata = d.imputed.test)
+# # Correlation between predicted and actual rate
+# cor(d.imputed.test$mortality_rate, d.imputed.test$PredictedRate_T2M)
+# 
+# 
+# # PM10
+# d.imputed.test$PredictedRate_PM10 <-predict(lm.d.imputed.train.PM10,
+#                                             newdata = d.imputed.test)
+# # Correlation between predicted and actual rate
+# cor(d.imputed.test$mortality_rate, d.imputed.test$PredictedRate_PM10)
+# 
+# 
+# # PM25
+# d.imputed.test$PredictedRate_PM25 <-predict(lm.d.imputed.train.PM25,
+#                                             newdata = d.imputed.test)
+# # Correlation between predicted and actual rate
+# cor(d.imputed.test$mortality_rate, d.imputed.test$PredictedRate_PM25)
+# 
+# 
+# 
+# # -------------------------MULTIPLE REGRESSION WITH PM25 and complete------------------------------------
+# d.imputed.test$PredictedRate_mlm_PM25 <-predict(mlm.pm25.d.imputed.train, 
+#                                                                           newdata = d.imputed.test)
+# # Correlation between predicted and actual rate
+# cor(d.imputed.test$mortality_rate, d.imputed.test$PredictedRate_mlm_PM25)
+# 
+# # --------------------without PM25--------------------------
+# d.imputed.test$PredictedRate_mlm <-predict(mlm.d.imputed.train, 
+#                                                                      newdata = d.imputed.test)
+# # Correlation between predicted and actual rate
+# cor(d.imputed.test$mortality_rate, d.imputed.test$PredictedRate_mlm)
+# 
+# 
+# 
+# 
+# # ---------------------------------------Random Forest-----------------------------------------
+# 
+# # ------------------------------------------imputed-----------------------------------------------
+# 
+# d_rf.imputed.train <- d.imputed.train[, !names(d.imputed.train) %in% c("Id", "date")]
+# d_rf.imputed.test <- d.imputed.test[, !names(d.imputed.test) %in% c("Id", "date", "mortality_rate")]
+# mrf.imputed <- randomForest(mortality_rate ~ ., data=d_rf.imputed.train, importance = TRUE, ntree = 100)
+# 
+# varImpPlot(mrf.imputed)
+# 
+# # prediction
+# d_rf.imputed.test$forest_predict <- predict(mrf.imputed, d_rf.imputed.test)
+# print("cor for rf on imputed training data set")
+# cor(d.imputed.test$mortality_rate, d_rf.imputed.test$forest_predict)
+# 
+# 
+# # ------------------------------------------complete-----------------------------------------------
+# 
+# d_rf.complete.train <- d.complete.train[, !names(d.complete.train) %in% c("Id", "date")]
+# d_rf.complete.test <- d.complete.test[, !names(d.complete.test) %in% c("Id", "date", "mortality_rate")]
+# mrf.complete <- randomForest(mortality_rate ~ ., data=d_rf.complete.train, importance = TRUE, ntree = 100)
+# varImpPlot(mrf.complete)
+# 
+# # prediction
+# d_rf.complete.test$forest_predict <- predict(mrf.complete, d_rf.complete.test)
+# print("cor for rf on complete training data set")
+# cor(d.complete.test$mortality_rate, d_rf.complete.test$forest_predict)
+
+#############################################################################
+#############################################################################
+#############################################################################
+```
